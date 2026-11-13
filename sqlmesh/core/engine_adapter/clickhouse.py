@@ -1,0 +1,1393 @@
+from __future__ import annotations
+
+import typing as t
+import logging
+import re
+from functools import cached_property
+from sqlglot import exp, maybe_parse
+from sqlglot.optimizer.scope import Scope, find_all_in_scope, traverse_scope
+from sqlmesh.core.dialect import to_schema
+from sqlmesh.core.engine_adapter.mixins import LogicalMergeMixin
+from sqlmesh.core.engine_adapter.base import EngineAdapterWithIndexSupport
+from sqlmesh.core.engine_adapter.shared import (
+    CatalogSupport,
+    DataObject,
+    DataObjectType,
+    EngineRunMode,
+    SourceQuery,
+    CommentCreationTable,
+    CommentCreationView,
+    InsertOverwriteStrategy,
+)
+from sqlmesh.core.schema_diff import TableAlterOperation
+from sqlmesh.utils import get_source_columns_to_types
+from sqlmesh.utils.errors import SQLMeshError
+
+if t.TYPE_CHECKING:
+    import pandas as pd
+
+    from sqlmesh.core._typing import SchemaName, TableName
+    from sqlmesh.core.engine_adapter._typing import DF, Query, QueryOrDF
+
+    from sqlmesh.core.node import IntervalUnit
+
+
+logger = logging.getLogger(__name__)
+
+# `system.databases.engine` value for a Keeper-coordinated database. Object DDL inside one
+# must not carry `ON CLUSTER`: the database's own DDL log already propagates it to every
+# replica, so ClickHouse rejects the redundant second fan-out outright with code 80,
+# `It's not initial query. ON CLUSTER is not allowed for Replicated database.`
+# Matched as a prefix so engine variants are covered without another release.
+REPLICATED_DATABASE_ENGINE_PREFIX = "Replicated"
+
+
+class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
+    DIALECT = "clickhouse"
+    SUPPORTS_TRANSACTIONS = False
+    SUPPORTS_VIEW_SCHEMA = False
+    SUPPORTS_REPLACE_TABLE = False
+    COMMENT_CREATION_TABLE = CommentCreationTable.COMMENT_COMMAND_ONLY
+    COMMENT_CREATION_VIEW = CommentCreationView.COMMENT_COMMAND_ONLY
+
+    SCHEMA_DIFFER_KWARGS = {}
+
+    DEFAULT_TABLE_ENGINE = "MergeTree"
+    ORDER_BY_TABLE_ENGINE_REGEX = "^.*?MergeTree.*$"
+
+    @property
+    def catalog_support(self) -> CatalogSupport:
+        # This property is intentionally dynamic: it transitions from UNSUPPORTED to
+        # SINGLE_CATALOG_ONLY after inject_virtual_catalog() sets _default_catalog. Callers must
+        # not cache the result — always read it live so they see the post-injection state.
+        if self._default_catalog:
+            return CatalogSupport.SINGLE_CATALOG_ONLY
+        return CatalogSupport.UNSUPPORTED
+
+    def supports_virtual_catalog(self) -> bool:
+        return True
+
+    def inject_virtual_catalog(self, gateway: str) -> None:
+        configured = self._extra_config.get("virtual_catalog")
+        self._default_catalog = f"__{gateway}__" if configured is None else configured
+
+    def _to_sql(self, expression: exp.Expr, quote: bool = True, **kwargs: t.Any) -> str:
+        """Render SQL without the virtual catalog, which ClickHouse does not support."""
+        virtual_catalog = self._default_catalog or self._extra_config.get("virtual_catalog")
+        if virtual_catalog and any(self._virtual_catalog_references(expression)):
+            expression = expression.copy()
+            for reference in list(self._virtual_catalog_references(expression)):
+                reference.set("catalog", None)
+        if isinstance(expression, exp.Query):
+            expression = self._map_catalog_references(expression, preserve_unmapped=True)
+        elif isinstance(expression, exp.Delete):
+            where = expression.args.get("where")
+            if where and any(where.find_all(exp.Query)):
+                expression = expression.copy()
+                where = expression.args["where"]
+                expression.set(
+                    "where",
+                    where.transform(
+                        lambda node: self._map_catalog_references(node)
+                        if isinstance(node, exp.Query)
+                        else node,
+                        copy=False,
+                    ),
+                )
+        elif isinstance(expression, exp.Insert) and isinstance(expression.expression, exp.Query):
+            expression = expression.copy()
+            expression.set("expression", self._map_catalog_references(expression.expression))
+        return super()._to_sql(expression, quote=quote, **kwargs)
+
+    def _virtual_catalog_references(
+        self, expression: exp.Expr
+    ) -> t.Iterator[t.Union[exp.Table, exp.Column]]:
+        virtual_catalog = self._default_catalog or self._extra_config.get("virtual_catalog")
+        return (
+            reference
+            for reference in self._catalog_references(expression)
+            if virtual_catalog and reference.text("catalog") == virtual_catalog
+        )
+
+    def _get_source_queries(
+        self,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        target_table: TableName,
+        *,
+        batch_size: t.Optional[int] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+    ) -> t.List[SourceQuery]:
+        if isinstance(query_or_df, exp.Query):
+            query_or_df = self._map_catalog_references(query_or_df)
+        return super()._get_source_queries(
+            query_or_df,
+            target_columns_to_types,
+            target_table,
+            batch_size=batch_size,
+            source_columns=source_columns,
+        )
+
+    def _map_catalog_references(self, query: Query, *, preserve_unmapped: bool = False) -> Query:
+        mapping = self._extra_config.get("datalake_catalog_mapping") or {}
+        if not self._default_catalog and not mapping:
+            return query
+
+        mapped_catalogs = {self._default_catalog, *mapping}
+        query = query.copy()
+        for reference in self._catalog_references(query):
+            if not reference.catalog or (
+                preserve_unmapped and reference.catalog not in mapped_catalogs
+            ):
+                continue
+            if isinstance(reference, exp.Table):
+                self._map_catalog_reference(reference)
+                continue
+
+            table = self._map_catalog_reference(
+                exp.Table(
+                    this=reference.args["table"].copy(),
+                    db=reference.args["db"].copy(),
+                    catalog=reference.args["catalog"].copy(),
+                )
+            )
+            for column_key, table_key in (("table", "this"), ("db", "db"), ("catalog", "catalog")):
+                value = table.args.get(table_key)
+                reference.set(column_key, value.copy() if value is not None else None)
+        return query
+
+    def _catalog_references(self, expression: exp.Expr) -> t.List[t.Union[exp.Table, exp.Column]]:
+        """Use query scopes to distinguish qualified columns from nested-field paths."""
+        tables = list(expression.find_all(exp.Table))
+        references: t.List[t.Union[exp.Table, exp.Column]] = list(tables)
+        root_tables = list(find_all_in_scope(expression, exp.Table))
+        scoped_columns = set()
+        virtual_catalog = self._default_catalog or self._extra_config.get("virtual_catalog")
+
+        def matches_source_table(column: exp.Column, table: exp.Table) -> bool:
+            if (column.catalog, column.db, column.table) == (table.catalog, table.db, table.name):
+                return True
+            # ClickHouse strips the virtual catalog from DML targets before SQL rendering.
+            return (
+                column.catalog == virtual_catalog
+                and not table.catalog
+                and (column.db, column.table) == (table.db, table.name)
+            )
+
+        def add_column_reference(column: exp.Column, scope: t.Optional[Scope]) -> None:
+            if not column.catalog:
+                return
+            current_scope = scope
+            while current_scope is not None:
+                # The nearest alias or CTE name takes precedence as a nested-field path.
+                if column.catalog in current_scope.sources:
+                    return
+                if any(
+                    isinstance(source, exp.Table) and matches_source_table(column, source)
+                    for source in current_scope.sources.values()
+                ):
+                    references.append(column)
+                    return
+                current_scope = current_scope.parent
+
+            if column.catalog in {table.alias_or_name for table in root_tables}:
+                return
+            if any(matches_source_table(column, table) for table in root_tables):
+                references.append(column)
+
+        for scope in traverse_scope(expression):
+            for column in scope.find_all(exp.Column):
+                scoped_columns.add(id(column))
+                add_column_reference(column, scope)
+
+        for column in find_all_in_scope(expression, exp.Column):
+            if id(column) not in scoped_columns:
+                add_column_reference(column, None)
+        return references
+
+    def _map_catalog_reference(self, table: exp.Table) -> exp.Table:
+        """Map catalog.schema.table to a ClickHouse DataLakeCatalog database.table reference."""
+        catalog = table.catalog
+        if not catalog:
+            return table
+        if catalog == self._default_catalog:
+            table.set("catalog", None)
+            return table
+
+        target_database = (self._extra_config.get("datalake_catalog_mapping") or {}).get(catalog)
+        if target_database:
+            if not table.db:
+                raise SQLMeshError(
+                    f"ClickHouse DataLakeCatalog mapping for '{catalog}' requires a "
+                    "three-level catalog.schema.table reference"
+                )
+            source_table = f"{table.db}.{table.name}"
+            table.set("catalog", None)
+            table.set("db", exp.to_identifier(target_database))
+            table.set("this", exp.to_identifier(source_table, quoted=True))
+            return table
+
+        raise SQLMeshError(
+            f"{self.dialect} requires that all catalog operations be against the virtual "
+            f"catalog {self._default_catalog!r} or a configured DataLakeCatalog mapping. "
+            f"Provided catalog: {catalog}"
+        )
+
+    @property
+    def engine_run_mode(self) -> EngineRunMode:
+        if self._extra_config.get("cloud_mode"):
+            return EngineRunMode.CLOUD
+        # we use the user's specification of a cluster in the connection config to determine if
+        #   the engine is in cluster mode
+        if self._extra_config.get("cluster"):
+            return EngineRunMode.CLUSTER
+        return EngineRunMode.STANDALONE
+
+    @property
+    def cluster(self) -> t.Optional[str]:
+        return self._extra_config.get("cluster")
+
+    # Workaround for clickhouse-connect cursor bug
+    # - cursor does not reset row index correctly on `close()`, so `fetchone()` and `fetchmany()`
+    #     return the wrong (or no) rows after the very first cursor query that returns rows
+    #     in the connection
+    # - cursor does reset the data rows correctly on `close()`, so `fetchall()` works because it
+    #     doesn't use the row index at all
+    def fetchone(
+        self,
+        query: t.Union[exp.Expr, str],
+        ignore_unsupported_errors: bool = False,
+        quote_identifiers: bool = False,
+    ) -> t.Tuple:
+        with self.transaction():
+            self.execute(
+                query,
+                ignore_unsupported_errors=ignore_unsupported_errors,
+                quote_identifiers=quote_identifiers,
+            )
+            return self.cursor.fetchall()[0]
+
+    def _fetch_native_df(
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
+    ) -> pd.DataFrame:
+        """Fetches a Pandas DataFrame from the cursor"""
+        return self.cursor.client.query_df(
+            self._to_sql(query, quote=quote_identifiers) if isinstance(query, exp.Expr) else query,
+            use_extended_dtypes=True,
+        )
+
+    def _df_to_source_queries(
+        self,
+        df: DF,
+        target_columns_to_types: t.Dict[str, exp.DataType],
+        batch_size: int,
+        target_table: TableName,
+        source_columns: t.Optional[t.List[str]] = None,
+        **kwargs: t.Any,
+    ) -> t.List[SourceQuery]:
+        temp_table = self._get_temp_table(target_table, **kwargs)
+        source_columns_to_types = get_source_columns_to_types(
+            target_columns_to_types, source_columns
+        )
+
+        def query_factory() -> Query:
+            # It is possible for the factory to be called multiple times and if so then the temp table will already
+            # be created so we skip creating again. This means we are assuming the first call is the same result
+            # as later calls.
+            if not self.table_exists(temp_table):
+                self.create_table(
+                    temp_table,
+                    source_columns_to_types,
+                    storage_format=exp.var("MergeTree"),
+                    **kwargs,
+                )
+                ordered_df = df[list(source_columns_to_types)]
+
+                self.cursor.client.insert_df(temp_table.sql(dialect=self.dialect), df=ordered_df)
+
+            return exp.select(*self._casted_columns(target_columns_to_types, source_columns)).from_(
+                temp_table
+            )
+
+        return [
+            SourceQuery(
+                query_factory=query_factory,
+                cleanup_func=lambda: self.drop_table(temp_table, **kwargs),
+            )
+        ]
+
+    def _get_data_objects(
+        self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
+    ) -> t.List[DataObject]:
+        """
+        Returns all the data objects that exist in the given database.
+        """
+        query = (
+            exp.select(
+                exp.column("database").as_("schema_name"),
+                exp.column("name"),
+                exp.case(exp.column("engine"))
+                .when(
+                    exp.Literal.string("View"),
+                    exp.Literal.string("view"),
+                )
+                .else_(
+                    exp.Literal.string("table"),
+                )
+                .as_("type"),
+            )
+            .from_("system.tables")
+            .where(exp.column("database").eq(to_schema(schema_name).db))
+        )
+        if object_names:
+            query = query.where(exp.column("name").isin(*object_names))
+        df = self.fetchdf(query)
+        return [
+            DataObject(
+                catalog=None,
+                schema=row.schema_name,
+                name=row.name,
+                type=DataObjectType.from_str(row.type),  # type: ignore
+            )
+            for row in df.itertuples()
+        ]
+
+    def create_schema(
+        self,
+        schema_name: SchemaName,
+        ignore_if_exists: bool = True,
+        warn_on_error: bool = True,
+        properties: t.List[exp.Expr] = [],
+    ) -> None:
+        """Create a Clickhouse database from a name or qualified table name.
+
+        Clickhouse has a two-level naming scheme [database].[table].
+        """
+        from sqlmesh.utils.errors import SQLMeshError
+
+        properties_copy = properties.copy()
+        # Always cluster-wide, deliberately. This is the statement that creates the
+        # database, including a `Replicated` one, so there is no database engine to
+        # consult yet and nothing for Keeper to propagate through.
+        if self.engine_run_mode.is_cluster:
+            properties_copy.append(exp.OnCluster(this=exp.to_identifier(self.cluster)))
+
+        # A database that previously resolved as absent may now exist, with an engine.
+        self._clear_database_engine_cache()
+
+        # ClickHouse does not support catalogs. When a virtual catalog has been injected
+        # (self._default_catalog is set), strip it from the schema name. This mirrors the
+        # SINGLE_CATALOG_ONLY branch in the set_catalog decorator, which does not apply here
+        # because this override is not wrapped by @set_catalog().
+        if self._default_catalog:
+            schema_exp = to_schema(schema_name)
+            catalog_name = schema_exp.catalog
+            if catalog_name:
+                if catalog_name != self._default_catalog:
+                    raise SQLMeshError(
+                        f"clickhouse requires that all catalog operations be against a single catalog: "
+                        f"{self._default_catalog}. Provided catalog: {catalog_name}"
+                    )
+                schema_name = self._strip_virtual_catalog(schema_exp)
+
+        # can't call super() because it will try to set a catalog
+        return self._create_schema(
+            schema_name=schema_name,
+            ignore_if_exists=ignore_if_exists,
+            warn_on_error=warn_on_error,
+            properties=properties_copy,
+            # sqlglot transpiles CREATE SCHEMA to CREATE DATABASE, but this text is used in an error message
+            kind="DATABASE",
+        )
+
+    def _insert_overwrite_by_condition(
+        self,
+        table_name: TableName,
+        source_queries: t.List[SourceQuery],
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        where: t.Optional[exp.Condition] = None,
+        insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
+        **kwargs: t.Any,
+    ) -> None:
+        """
+        Implements the table or partition swap approach to insert-overwriting records.
+
+        Because this method executes multiple variants (full table replace, replace by time
+        range, replace by key, replace by partition), some upstream caller info is needed and
+        passed via kwargs.
+
+        Args:
+            table_name: Name of target table
+            source_queries: Source queries returning records to insert
+            target_columns_to_types: Column names and data types of target table
+            where: SQLGlot expression determining which target table rows should be overwritten
+            insert_overwrite_strategy_override: Not used by Clickhouse
+            kwargs:
+                dynamic_key: Key columns (replace by key only)
+                dynamic_key_exp: Expression to build key (replace by key only)
+                dynamic_key_unique: Whether more than one record can exist per key value (replace by key only)
+
+                keep_existing_partition_rows: Whether to overwrite partitions with only new records (incremental by partition only)
+
+        Returns:
+            Side effects only: execution of insert-overwrite operation.
+        """
+        target_table = exp.to_table(table_name)
+        target_columns_to_types = target_columns_to_types or self.columns(target_table)
+
+        temp_table = self._get_temp_table(target_table)
+        self.create_table_like(temp_table, target_table)
+
+        # REPLACE BY KEY: extract kwargs if present
+        dynamic_key = kwargs.get("dynamic_key")
+        if dynamic_key:
+            dynamic_key_exp = t.cast(exp.Expr, kwargs.get("dynamic_key_exp"))
+            dynamic_key_unique = t.cast(bool, kwargs.get("dynamic_key_unique"))
+
+        try:
+            # insert new records into temp table
+            for source_query in source_queries:
+                with source_query as query:
+                    # REPLACE BY KEY: if unique key, DISTINCTify by key columns so only one row is present per key
+                    if dynamic_key and dynamic_key_unique:
+                        query = query.distinct(*dynamic_key)  # type: ignore
+
+                    query = self._order_projections_and_filter(
+                        query, target_columns_to_types, where=where
+                    )
+                    self._insert_append_query(
+                        temp_table,
+                        query,
+                        target_columns_to_types=target_columns_to_types,
+                        order_projections=False,
+                    )
+
+            # REPLACE BY KEY: build `where` expression as "key IN (new rows' key values)"
+            if dynamic_key:
+                key_query = exp.select(dynamic_key_exp).from_(temp_table)
+                if not dynamic_key_unique:
+                    key_query = key_query.distinct()
+                where = dynamic_key_exp.isin(query=key_query)
+
+            # get target table partition key to confirm it's actually partitioned
+            table_partition_exp = self.fetchone(
+                exp.select("partition_key")
+                .from_("system.tables")
+                .where(
+                    exp.column("database").eq(target_table.db),
+                    exp.column("name").eq(target_table.name),
+                )
+            )
+
+            all_affected_partitions: t.Set[str] = set()
+
+            if where:
+                # identify existing records to keep by inverting the delete `where` clause
+                existing_records_insert_exp = exp.insert(
+                    self._select_columns(target_columns_to_types)
+                    .from_(target_table)
+                    .where(exp.paren(expression=where).not_()),
+                    temp_table,
+                )
+
+                # if target table is partitioned, modify insert expression to only insert
+                #   existing records that are in one of the affected partitions
+                if table_partition_exp:
+                    partitions_temp_table_name = self._get_temp_table(
+                        exp.to_table(f"{target_table.db}._affected_partitions")
+                    )
+                    all_affected_partitions, existing_records_insert_exp = (
+                        self._get_affected_partitions_and_insert_exp(
+                            target_table,
+                            temp_table,
+                            where,
+                            existing_records_insert_exp,
+                            partitions_temp_table_name,
+                        )
+                    )
+
+                try:
+                    self.execute(existing_records_insert_exp, track_rows_processed=True)
+                finally:
+                    if table_partition_exp:
+                        self.drop_table(partitions_temp_table_name)
+
+            # process by partition if:
+            #   1. The table is partitioned AND
+            #   (2a. There are existing records to keep (`where`) OR
+            #    2b. We're overwriting existing partition rows (incremental by partition model))
+            if table_partition_exp and (
+                where or kwargs.get("keep_existing_partition_rows") is False
+            ):
+                # only replace partitions that have records in temp_table
+                partitions_to_replace = self._get_partition_ids(temp_table)
+
+                # drop affected partitions that have no records in temp_table
+                #   - NOTE: `all_affected_partitions` will be empty when keep_existing_partition_rows=False
+                #      because previous code block is skipped
+                partitions_to_drop = all_affected_partitions - partitions_to_replace
+
+                if partitions_to_replace or partitions_to_drop:
+                    self.alter_table(
+                        [
+                            self._build_alter_partition_exp(
+                                target_table, temp_table, partitions_to_replace, partitions_to_drop
+                            )
+                        ]
+                    )
+            else:
+                self._exchange_tables(target_table, temp_table)
+        finally:
+            self.drop_table(temp_table)
+
+    def _get_affected_partitions_and_insert_exp(
+        self,
+        target_table: exp.Table,
+        temp_table: exp.Table,
+        where: exp.Condition,
+        existing_records_insert_exp: exp.Insert,
+        partitions_temp_table_name: exp.Table,
+    ) -> tuple[t.Set[str], exp.Insert]:
+        # identify all affected partition IDs
+        #   - store in temp table so we can reuse results
+        self.ctas(
+            partitions_temp_table_name,
+            exp.select("partition_id")
+            .distinct()
+            .from_(
+                exp.union(
+                    # target table partitions with records in `where`
+                    exp.select(exp.column("_partition_id").as_("partition_id"))
+                    .from_(target_table)
+                    .where(where),
+                    # temp table partitions with new records to insert
+                    exp.select(
+                        exp.column("_partition_id").as_("partition_id"),
+                    ).from_(temp_table),
+                ).subquery("_affected_partitions")
+            ),
+        )
+
+        # read all affected partition IDs into memory
+        all_affected_partitions = self._get_partition_ids(
+            partitions_temp_table_name, "partition_id"
+        )
+
+        # limit existing records insert expression WHERE to affected target table partitions
+        #   by adding `AND _partition_id IN (SELECT partition_id FROM partitions_temp_table)`
+        existing_records_insert_exp.set(
+            "expression",
+            existing_records_insert_exp.expression.where(
+                exp.column("_partition_id").isin(
+                    exp.select("partition_id").from_(partitions_temp_table_name)
+                )
+            ),
+        )
+
+        return all_affected_partitions, existing_records_insert_exp
+
+    def _build_alter_partition_exp(
+        self,
+        target_table: exp.Table,
+        temp_table: exp.Table,
+        partitions_to_replace: t.Set[str],
+        partitions_to_drop: t.Set[str],
+    ) -> exp.Alter:
+        alter_expr = exp.Alter(this=target_table, kind="TABLE")
+
+        for partition in sorted(partitions_to_replace):
+            alter_expr.append(
+                "actions",
+                exp.ReplacePartition(
+                    expression=exp.Partition(
+                        expressions=[exp.PartitionId(this=exp.Literal.string(str(partition)))]
+                    ),
+                    source=temp_table,
+                ),
+            )
+
+        for partition in sorted(partitions_to_drop):
+            alter_expr.append(
+                "actions",
+                exp.DropPartition(
+                    expressions=[
+                        exp.Partition(
+                            expressions=[exp.PartitionId(this=exp.Literal.string(str(partition)))]
+                        )
+                    ],
+                    source=temp_table,
+                ),
+            )
+
+        return alter_expr
+
+    def _replace_by_key(
+        self,
+        target_table: TableName,
+        source_table: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
+        key: t.Sequence[exp.Expr],
+        is_unique_key: bool,
+        source_columns: t.Optional[t.List[str]] = None,
+    ) -> None:
+        source_queries, target_columns_to_types = self._get_source_queries_and_columns_to_types(
+            source_table,
+            target_columns_to_types,
+            target_table=target_table,
+            source_columns=source_columns,
+        )
+
+        key_exp = (
+            exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", *key, dialect=self.dialect)
+            if len(key) > 1
+            else key[0]
+        )
+
+        self._insert_overwrite_by_condition(
+            target_table,
+            source_queries,
+            target_columns_to_types,
+            dynamic_key=key,
+            dynamic_key_exp=key_exp,
+            dynamic_key_unique=is_unique_key,
+        )
+
+    def insert_overwrite_by_partition(
+        self,
+        table_name: TableName,
+        query_or_df: QueryOrDF,
+        partitioned_by: t.List[exp.Expr],
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+    ) -> None:
+        table_name = self._strip_virtual_catalog(table_name)
+        source_queries, target_columns_to_types = self._get_source_queries_and_columns_to_types(
+            query_or_df,
+            target_columns_to_types,
+            target_table=table_name,
+            source_columns=source_columns,
+        )
+
+        self._insert_overwrite_by_condition(
+            table_name, source_queries, target_columns_to_types, keep_existing_partition_rows=False
+        )
+
+    def _create_table_like(
+        self,
+        target_table_name: TableName,
+        source_table_name: TableName,
+        exists: bool,
+        **kwargs: t.Any,
+    ) -> None:
+        """Create table with identical structure as source table"""
+        target_table_sql = self._strip_virtual_catalog(target_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+        source_table_sql = self._strip_virtual_catalog(source_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+        self.execute(
+            f"CREATE TABLE {target_table_sql}"
+            f"{self._on_cluster_sql(target_table_name)} AS {source_table_sql}"
+        )
+
+    def _get_partition_ids(
+        self,
+        table: exp.Table,
+        partition_col_name: str = "_partition_id",
+        where: t.Optional[exp.Condition] = None,
+        limit: t.Optional[int] = None,
+    ) -> t.Set[t.Any]:
+        """List partition IDs present in table"""
+        partitions_query = exp.select(partition_col_name).distinct().from_(table)
+        if where:
+            partitions_query = partitions_query.where(where)
+        if limit:
+            partitions_query = partitions_query.limit(limit)
+        partitions = self.fetchall(partitions_query)
+
+        return set([part[0] for part in partitions] if partitions else [])
+
+    def _create_table(
+        self,
+        table_name_or_schema: t.Union[exp.Schema, TableName],
+        expression: t.Optional[exp.Expr],
+        exists: bool = True,
+        replace: bool = False,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        table_kind: t.Optional[str] = None,
+        track_rows_processed: bool = True,
+        **kwargs: t.Any,
+    ) -> None:
+        """Creates a table in the database.
+
+        Clickhouse Cloud requires doing CTAS in two steps.
+
+        First, we add the `EMPTY` property to the CTAS call to create a table with the proper
+        schema, then insert the data with the CTAS query.
+        """
+        # ensure columns used for partitioning are non-Nullable
+        #   - normally user's responsibility, but we automatically partition by time column in
+        #       incremental by time models
+        if kwargs.get("partitioned_by"):
+            partition_cols = [
+                col.name
+                for part_expr in kwargs["partitioned_by"]
+                for col in part_expr.find_all(exp.Column)
+            ]
+            if isinstance(table_name_or_schema, exp.Schema):
+                for coldef in table_name_or_schema.expressions:
+                    if coldef.name in partition_cols:
+                        coldef.kind.set("nullable", False)
+            if target_columns_to_types:
+                for col in partition_cols:
+                    target_columns_to_types[col].set("nullable", False)
+
+        super()._create_table(
+            table_name_or_schema,
+            expression,
+            exists,
+            replace,
+            target_columns_to_types,
+            table_description,
+            column_descriptions,
+            table_kind,
+            empty_ctas=(self.engine_run_mode.is_cloud and expression is not None),
+            track_rows_processed=track_rows_processed,
+            **kwargs,
+        )
+
+        # execute the second INSERT step if on cloud and creating a table
+        # - Additional clause is to avoid clickhouse-connect HTTP client bug where CTAS LIMIT 0
+        #     returns a success code but malformed response
+        if (
+            self.engine_run_mode.is_cloud
+            and table_kind != "VIEW"
+            and expression
+            and not (
+                expression.args.get("limit") is not None
+                and expression.args["limit"].expression.this == "0"
+            )
+        ):
+            table_name = (
+                table_name_or_schema.this
+                if isinstance(table_name_or_schema, exp.Schema)
+                else table_name_or_schema
+            )
+            self._insert_append_query(
+                table_name,
+                expression,  # type: ignore
+                target_columns_to_types or self.columns(table_name),
+            )
+
+    def create_view(
+        self,
+        view_name: TableName,
+        query_or_df: QueryOrDF,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        replace: bool = True,
+        materialized: bool = False,
+        materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
+        table_description: t.Optional[str] = None,
+        column_descriptions: t.Optional[t.Dict[str, str]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+        **create_kwargs: t.Any,
+    ) -> None:
+        if self._default_catalog and isinstance(query_or_df, exp.Query):
+            from sqlmesh.utils.errors import SQLMeshError
+
+            query_or_df = query_or_df.copy()
+            for table in query_or_df.find_all(exp.Table):
+                if not table.catalog:
+                    continue
+                if table.catalog != self._default_catalog:
+                    raise SQLMeshError(
+                        f"{self.dialect} requires that all catalog operations be against a single "
+                        f"catalog: {self._default_catalog}. Provided catalog: {table.catalog}"
+                    )
+                table.set("catalog", None)
+
+        super().create_view(
+            view_name,
+            query_or_df,
+            target_columns_to_types=target_columns_to_types,
+            replace=replace,
+            materialized=materialized,
+            materialized_properties=materialized_properties,
+            table_description=table_description,
+            column_descriptions=column_descriptions,
+            view_properties=view_properties,
+            source_columns=source_columns,
+            **create_kwargs,
+        )
+
+    def _strip_virtual_catalog(self, name: "TableName") -> exp.Table:
+        """Strip the virtual catalog prefix from a table name if present.
+
+        When a virtual catalog has been injected, ClickHouse table names carry a
+        synthetic catalog prefix (e.g. ``__gw__``) so they match the 3-level FQN
+        depth of catalog-aware peers.  This helper removes that prefix before any
+        SQL is sent to the wire, since ClickHouse only supports a two-level
+        ``[database].[table]`` naming scheme.
+        """
+        table = exp.to_table(name, dialect=self.dialect)
+        if self._default_catalog and table.catalog == self._default_catalog:
+            table.set("catalog", None)
+        return table
+
+    def _exchange_tables(
+        self,
+        old_table_name: TableName,
+        new_table_name: TableName,
+    ) -> None:
+        from clickhouse_connect.driver.exceptions import DatabaseError  # type: ignore
+
+        old_table_sql = self._strip_virtual_catalog(old_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+        new_table_sql = self._strip_virtual_catalog(new_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+
+        on_cluster_sql = (
+            self._on_cluster_sql(old_table_name)
+            if self._assert_same_on_cluster_scope("EXCHANGE TABLES", old_table_name, new_table_name)
+            else ""
+        )
+
+        try:
+            self.execute(f"EXCHANGE TABLES {old_table_sql} AND {new_table_sql}{on_cluster_sql}")
+        except DatabaseError as e:
+            if "NOT_IMPLEMENTED" in str(e):
+                # If someone is using an old Clickhouse version, an OS that doesn't support atomic exchanges,
+                # or a database engine that doesn't support atomic exchanges, we do a non-atomic rename instead.
+                #
+                # Executing multiple renames in one call like `RENAME TABLE a to b, c to a` is supported
+                # but not an atomic operation. Because it is not atomic, doing it in two calls is equivalent
+                # and does not require defining an additional method.
+                throwaway_table_name = self._get_temp_table(old_table_name)
+                self._rename_table(old_table_name, throwaway_table_name)
+                self._rename_table(new_table_name, old_table_name)
+                self.drop_table(throwaway_table_name)
+
+    def _rename_table(
+        self,
+        old_table_name: TableName,
+        new_table_name: TableName,
+    ) -> None:
+        old_table_sql = self._strip_virtual_catalog(old_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+        new_table_sql = self._strip_virtual_catalog(new_table_name).sql(
+            dialect=self.dialect, identify=True
+        )
+
+        on_cluster_sql = (
+            self._on_cluster_sql(old_table_name)
+            if self._assert_same_on_cluster_scope("RENAME TABLE", old_table_name, new_table_name)
+            else ""
+        )
+
+        self.execute(f"RENAME TABLE {old_table_sql} TO {new_table_sql}{on_cluster_sql}")
+
+    def delete_from(self, table_name: TableName, where: t.Union[str, exp.Expr]) -> None:
+        target_table = self._strip_virtual_catalog(table_name)
+        delete_expr = exp.delete(target_table, where)
+        if self._should_use_on_cluster(target_table):
+            delete_expr.set("cluster", exp.OnCluster(this=exp.to_identifier(self.cluster)))
+        self.execute(delete_expr)
+
+    def alter_table(
+        self,
+        alter_expressions: t.Union[t.List[exp.Alter], t.List[TableAlterOperation]],
+        table_format: t.Optional[str] = None,
+    ) -> None:
+        """
+        Performs the alter statements to change the current table into the structure of the target table.
+        """
+        with self.transaction():
+            for alter_expression in [
+                x.expression if isinstance(x, TableAlterOperation) else x for x in alter_expressions
+            ]:
+                if self._default_catalog and isinstance(alter_expression.this, exp.Table):
+                    if alter_expression.this.catalog == self._default_catalog:
+                        alter_expression.this.set("catalog", None)
+                # Decided per expression, not hoisted: one call can legitimately carry
+                # alters against both a Replicated and a non-Replicated database.
+                altered_table = (
+                    alter_expression.this if isinstance(alter_expression.this, exp.Table) else None
+                )
+                # Partition overwrites retain cluster fan-out to reach every shard.
+                alters_partitions = any(
+                    isinstance(action, (exp.DropPartition, exp.ReplacePartition))
+                    for action in alter_expression.args.get("actions", [])
+                )
+                if (
+                    self.engine_run_mode.is_cluster
+                    if alters_partitions
+                    else self._should_use_on_cluster(altered_table)
+                ):
+                    alter_expression.set(
+                        "cluster", exp.OnCluster(this=exp.to_identifier(self.cluster))
+                    )
+                self.execute(alter_expression)
+
+    def _drop_object(
+        self,
+        name: TableName | SchemaName,
+        exists: bool = True,
+        kind: str = "TABLE",
+        cascade: bool = False,
+        **drop_args: t.Any,
+    ) -> None:
+        """Drops an object.
+
+        An object could be a DATABASE, SCHEMA, VIEW, TABLE, DYNAMIC TABLE, TEMPORARY TABLE etc depending on the :kind.
+
+        Args:
+            name: The name of the table to drop.
+            exists: If exists, defaults to True.
+            kind: What kind of object to drop. Defaults to TABLE
+            **drop_args: Any extra arguments to set on the Drop expression
+        """
+        # Dropping the database itself is always cluster-wide: the Keeper-backed DDL log
+        # being dropped cannot propagate its own removal, and `name` here is a database
+        # rather than an object inside one.
+        is_database = kind.upper() in ("SCHEMA", "DATABASE")
+        use_on_cluster = (
+            self.engine_run_mode.is_cluster if is_database else self._should_use_on_cluster(name)
+        )
+
+        if is_database:
+            # Cheap to rebuild and easy to get wrong for one entry; drop the lot.
+            self._clear_database_engine_cache()
+
+        super()._drop_object(
+            name=name,
+            exists=exists,
+            kind=kind,
+            cascade=cascade,
+            cluster=exp.OnCluster(this=exp.to_identifier(self.cluster)) if use_on_cluster else None,
+            **drop_args,
+        )
+
+    def _build_partitioned_by_exp(
+        self,
+        partitioned_by: t.List[exp.Expr],
+        **kwargs: t.Any,
+    ) -> t.Optional[t.Union[exp.PartitionedByProperty, exp.Property]]:
+        return exp.PartitionedByProperty(
+            this=exp.Schema(expressions=partitioned_by),
+        )
+
+    def ensure_nulls_for_unmatched_after_join(
+        self,
+        query: Query,
+    ) -> Query:
+        # Set `join_use_nulls = 1` in a query's SETTINGS clause
+        query.append("settings", exp.var("join_use_nulls").eq(exp.Literal.number("1")))
+        return query
+
+    def use_server_nulls_for_unmatched_after_join(
+        self,
+        query: Query,
+    ) -> Query:
+        # Set the `join_use_nulls` server value in a query's SETTINGS clause
+        #
+        # Use in SCD models:
+        #  - The SCD query we build must include the setting `join_use_nulls = 1` to ensure that empty cells in a join
+        #      are filled with NULL instead of the default data type value. The default join_use_nulls value is `0`.
+        #  - The SCD embeds the user's original query in the `source` CTE
+        #  - Settings are dynamically scoped, so our setting may override the server's default setting the user expects
+        #      for their query.
+        #  - To prevent this, we:
+        #     - If the user query sets `join_use_nulls`, we do nothing
+        #     - If the user query does not set `join_use_nulls`, we query the server for the current setting
+        #       - If the server value is 1, we do nothing
+        #       - If the server values is not 1, we inject its `join_use_nulls` value into the user query
+        #     - We do not need to check user subqueries because our injected setting operates at the same scope the
+        #         server value would normally operate at
+        setting_name = "join_use_nulls"
+        setting_value = "1"
+
+        user_settings = query.args.get("settings")
+        # if user has not already set it explicitly
+        if not (
+            user_settings
+            and any(
+                [
+                    isinstance(setting, exp.EQ) and setting.name == setting_name
+                    for setting in user_settings
+                ]
+            )
+        ):
+            server_value = self.fetchone(
+                exp.select("value")
+                .from_("system.settings")
+                .where(exp.column("name").eq(exp.Literal.string(setting_name)))
+            )[0]
+            # only inject the setting if the server value isn't 1
+            inject_setting = setting_value != server_value
+            setting_value = server_value if inject_setting else setting_value
+
+            if inject_setting:
+                query.append(
+                    "settings", exp.var(setting_name).eq(exp.Literal.number(setting_value))
+                )
+
+        return query
+
+    def _build_settings_property(
+        self, settings: t.Mapping[str, exp.Expr | str | int | float]
+    ) -> exp.SettingsProperty:
+        # ClickHouse requires every key=value pair to live under a single
+        # SETTINGS clause (`SETTINGS a = 1, b = 2`). Emitting one
+        # SettingsProperty per pair produces repeated SETTINGS keywords and a
+        # syntax error at execution time.
+        return exp.SettingsProperty(
+            expressions=[
+                exp.EQ(
+                    this=exp.var(key.lower()),
+                    expression=value
+                    if isinstance(value, exp.Expr)
+                    else exp.Literal(this=value, is_string=isinstance(value, str)),
+                )
+                for key, value in settings.items()
+            ]
+        )
+
+    def _build_table_properties_exp(
+        self,
+        catalog_name: t.Optional[str] = None,
+        table_format: t.Optional[str] = None,
+        storage_format: t.Optional[str] = None,
+        partitioned_by: t.Optional[t.List[exp.Expr]] = None,
+        partition_interval_unit: t.Optional[IntervalUnit] = None,
+        clustered_by: t.Optional[t.List[exp.Expr]] = None,
+        table_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        table_description: t.Optional[str] = None,
+        table_kind: t.Optional[str] = None,
+        empty_ctas: bool = False,
+        table: t.Optional[exp.Table] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[exp.Properties]:
+        properties: t.List[exp.Expr] = []
+
+        table_engine = self.DEFAULT_TABLE_ENGINE
+        if storage_format:
+            table_engine = (
+                storage_format.this if isinstance(storage_format, exp.Var) else storage_format  # type: ignore
+            )
+        properties.append(exp.EngineProperty(this=table_engine))
+
+        # copy of table_properties so we can pop items off below then consume the rest later
+        table_properties_copy = {
+            k.upper(): v for k, v in (table_properties.copy() if table_properties else {}).items()
+        }
+
+        mergetree_engine = bool(re.search(self.ORDER_BY_TABLE_ENGINE_REGEX, table_engine))
+        ordered_by_raw = table_properties_copy.pop("ORDER_BY", None)
+        if mergetree_engine:
+            ordered_by_exprs = []
+            if ordered_by_raw:
+                ordered_by_vals = []
+
+                if isinstance(ordered_by_raw, (exp.Tuple, exp.Array)):
+                    ordered_by_vals = ordered_by_raw.expressions
+                if isinstance(ordered_by_raw, exp.Paren):
+                    ordered_by_vals = [ordered_by_raw.this]
+
+                if not ordered_by_vals:
+                    ordered_by_vals = (
+                        ordered_by_raw if isinstance(ordered_by_raw, list) else [ordered_by_raw]
+                    )
+
+                for col in ordered_by_vals:
+                    ordered_by_exprs.append(
+                        col
+                        if isinstance(col, exp.Column)
+                        else maybe_parse(
+                            col.name if isinstance(col, exp.Literal) else col,
+                            dialect=self.dialect,
+                            into=exp.Ordered,
+                        )
+                    )
+
+            properties.append(exp.Order(expressions=[exp.Tuple(expressions=ordered_by_exprs)]))
+
+        primary_key = table_properties_copy.pop("PRIMARY_KEY", None)
+        if mergetree_engine and primary_key:
+            primary_key_vals = []
+            if isinstance(primary_key, (exp.Tuple, exp.Array)):
+                primary_key_vals = primary_key.expressions
+            if isinstance(primary_key, exp.Paren):
+                primary_key_vals = [primary_key.this]
+
+            if not primary_key_vals:
+                primary_key_vals = primary_key if isinstance(primary_key, list) else [primary_key]
+
+            properties.append(
+                exp.PrimaryKey(
+                    expressions=[
+                        exp.to_column(k.name if isinstance(k, exp.Literal) else k)
+                        for k in primary_key_vals
+                    ]
+                )
+            )
+
+        ttl = table_properties_copy.pop("TTL", None)
+        if ttl:
+            properties.append(
+                exp.MergeTreeTTL(expressions=[ttl if isinstance(ttl, exp.Expr) else exp.var(ttl)])
+            )
+
+        if (
+            partitioned_by
+            and (partitioned_by_prop := self._build_partitioned_by_exp(partitioned_by)) is not None
+        ):
+            properties.append(partitioned_by_prop)
+
+        if self._should_use_on_cluster(table):
+            properties.append(exp.OnCluster(this=exp.to_identifier(self.cluster)))
+
+        if empty_ctas:
+            properties.append(exp.EmptyProperty())
+
+        if table_properties_copy:
+            properties.append(self._build_settings_property(table_properties_copy))
+
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
+
+        if properties:
+            return exp.Properties(expressions=properties)
+
+        return None
+
+    def _build_view_properties_exp(
+        self,
+        view_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
+        table_description: t.Optional[str] = None,
+        table: t.Optional[exp.Table] = None,
+        **kwargs: t.Any,
+    ) -> t.Optional[exp.Properties]:
+        """Creates a SQLGlot table properties expression for view"""
+        properties: t.List[exp.Expr] = []
+
+        view_properties_copy = view_properties.copy() if view_properties else {}
+
+        if self._should_use_on_cluster(table):
+            properties.append(exp.OnCluster(this=exp.to_identifier(self.cluster)))
+
+        if view_properties_copy:
+            properties.append(self._build_settings_property(view_properties_copy))
+
+        if table_description:
+            properties.append(
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
+            )
+
+        if properties:
+            return exp.Properties(expressions=properties)
+        return None
+
+    def _build_create_comment_table_exp(
+        self, table: exp.Table, table_comment: str, table_kind: str, **kwargs: t.Any
+    ) -> exp.Comment | str:
+        table_sql = self._strip_virtual_catalog(table).sql(dialect=self.dialect, identify=True)
+
+        truncated_comment = self._truncate_table_comment(table_comment)
+        comment_sql = exp.Literal.string(truncated_comment).sql(dialect=self.dialect)
+
+        return f"ALTER TABLE {table_sql}{self._on_cluster_sql(table)} MODIFY COMMENT {comment_sql}"
+
+    def _build_create_comment_column_exp(
+        self,
+        table: exp.Table,
+        column_name: str,
+        column_comment: str,
+        table_kind: str = "TABLE",
+        **kwargs: t.Any,
+    ) -> exp.Comment | str:
+        table_sql = self._strip_virtual_catalog(table).sql(dialect=self.dialect, identify=True)
+        column_sql = exp.to_column(column_name).sql(dialect=self.dialect, identify=True)
+
+        truncated_comment = self._truncate_table_comment(column_comment)
+        comment_sql = exp.Literal.string(truncated_comment).sql(dialect=self.dialect)
+
+        return (
+            f"ALTER TABLE {table_sql}{self._on_cluster_sql(table)}"
+            f" COMMENT COLUMN {column_sql} {comment_sql}"
+        )
+
+    @cached_property
+    def _database_engine_cache(self) -> t.Dict[str, t.Optional[str]]:
+        return {}
+
+    @cached_property
+    def _has_replicated_database(self) -> bool:
+        """Whether this server hosts any Keeper-coordinated database at all.
+
+        One probe per connection, and the reason this change costs nothing on a
+        deployment that has no `Replicated` database: when the answer is no, every
+        `ON CLUSTER` decision short-circuits without resolving a target or querying
+        `system.databases` again.
+        """
+        row = self.fetchone(
+            exp.select(exp.func("count"))
+            .from_("system.databases")
+            .where(
+                exp.column("engine").like(
+                    exp.Literal.string(f"{REPLICATED_DATABASE_ENGINE_PREFIX}%")
+                )
+            )
+        )
+        return bool(row and row[0])
+
+    @cached_property
+    def _connection_database(self) -> t.Optional[str]:
+        """The database an unqualified object resolves to on this connection."""
+        row = self.fetchone("SELECT currentDatabase()")
+        return str(row[0]) if row and row[0] else None
+
+    def _clear_database_engine_cache(self) -> None:
+        self._database_engine_cache.clear()
+        # Creating or dropping a database can also change whether any Replicated one
+        # exists, which is what the short-circuit above depends on.
+        self.__dict__.pop("_has_replicated_database", None)
+
+    def _database_engine(self, database: str) -> t.Optional[str]:
+        """The engine of a ClickHouse database, or None when it cannot be resolved.
+
+        Deliberately connection-local rather than replica-wide: a `Replicated` database's
+        engine is uniform by construction, and `clusterAllReplicas` fails outright when any
+        host is down, which would turn an unrelated outage into a DDL failure.
+        """
+        cache = self._database_engine_cache
+        if database in cache:
+            return cache[database]
+
+        engine: t.Optional[str] = None
+        try:
+            row = self.fetchone(
+                exp.select("engine")
+                .from_("system.databases")
+                .where(exp.column("name").eq(exp.Literal.string(database)))
+            )
+            if row and row[0]:
+                engine = str(row[0])
+        except Exception as ex:
+            logger.warning(
+                f"Failed to determine engine for ClickHouse database '{database}'; "
+                f"keeping ON CLUSTER: {ex}"
+            )
+            # Keep this call fail-open, but retry the lookup on the next DDL.
+            return None
+
+        cache[database] = engine
+        return engine
+
+    def _on_cluster_target_database(self, target: t.Optional[TableName]) -> t.Optional[str]:
+        """The database an object DDL statement targets, or None when unknown."""
+        if target is None:
+            return None
+
+        table = exp.to_table(target, dialect=self.dialect) if isinstance(target, str) else target
+        if not isinstance(table, exp.Table):
+            return None
+
+        table = self._strip_virtual_catalog(table)
+        database = table.db
+        # An unqualified name resolves to the connection's database, not to "unknown".
+        if database:
+            return database
+        try:
+            return self._connection_database
+        except Exception as ex:
+            logger.warning(
+                f"Failed to determine current ClickHouse database; keeping ON CLUSTER: {ex}"
+            )
+            return None
+
+    def _should_use_on_cluster(self, target: t.Optional[TableName] = None) -> bool:
+        """Whether object DDL for `target` should carry `ON CLUSTER`.
+
+        Inside a `Replicated` database Keeper already propagates object DDL, so adding
+        `ON CLUSTER` asks for a second, redundant fan-out and ClickHouse refuses the
+        statement with code 80 `INCORRECT_QUERY`. Without this, no object can be created
+        in such a database at all while the adapter is in cluster mode.
+        Suppression cannot be a connection-level flag: one connection can hold both an
+        Atomic and a `Replicated` database, and objects in the Atomic one still need
+        `ON CLUSTER`.
+
+        Fails open. An unknown target, an unresolvable database, or any introspection
+        failure keeps today's behaviour, so this is a no-op for every deployment that has
+        no `Replicated` database.
+        """
+        if not self.engine_run_mode.is_cluster:
+            return False
+
+        try:
+            has_replicated_database = self._has_replicated_database
+        except Exception as ex:
+            logger.warning(
+                f"Failed to check for Replicated ClickHouse databases; keeping ON CLUSTER: {ex}"
+            )
+            return True
+
+        if not has_replicated_database:
+            return True
+
+        database = self._on_cluster_target_database(target)
+        if not database:
+            return True
+
+        engine = self._database_engine(database)
+        if engine is None:
+            return True
+
+        return not engine.startswith(REPLICATED_DATABASE_ENGINE_PREFIX)
+
+    def _on_cluster_sql(self, target: t.Optional[TableName] = None) -> str:
+        """Render the `ON CLUSTER` clause for object DDL against `target`.
+
+        Omitting `target` means "target unknown" and preserves the pre-existing
+        behaviour of always emitting in cluster mode.
+        """
+        if self._should_use_on_cluster(target):
+            cluster_name = exp.to_identifier(self.cluster, quoted=True).sql(dialect=self.dialect)  #  type: ignore
+            return f" ON CLUSTER {cluster_name} "
+        return ""
+
+    def _assert_same_on_cluster_scope(
+        self, operation: str, first: TableName, second: TableName
+    ) -> bool:
+        """Resolve one `ON CLUSTER` decision for a two-table statement.
+
+        `RENAME` and `EXCHANGE` can span databases, and a single statement cannot be both
+        cluster-wide and Keeper-propagated. Refuse rather than pick one and be silently
+        half-correct on the other.
+        """
+        from sqlmesh.utils.errors import SQLMeshError
+
+        first_scope = self._should_use_on_cluster(first)
+        second_scope = self._should_use_on_cluster(second)
+        if first_scope != second_scope:
+            first_sql = exp.to_table(first, dialect=self.dialect).sql(dialect=self.dialect)
+            second_sql = exp.to_table(second, dialect=self.dialect).sql(dialect=self.dialect)
+            raise SQLMeshError(
+                f"Cannot {operation} between a Replicated database and a non-Replicated one: "
+                f"{first_sql} and {second_sql} disagree on whether object DDL carries "
+                "ON CLUSTER. Move both objects into databases with the same engine."
+            )
+        return first_scope
