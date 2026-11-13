@@ -170,7 +170,7 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "20.11.25",
     "@types/vscode": "1.96.0",
-    "@vitest/ui": "^3.2.4",
+    "@vitest/ui": "^5.1.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.6.0",
