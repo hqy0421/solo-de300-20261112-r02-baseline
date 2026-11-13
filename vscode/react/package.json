@@ -55,7 +55,7 @@
     "storybook": "^9.0.18",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
-    "vitest": "^3.2.4",
+    "vitest": "^5.1.0",
     "web-vitals": "^6.2.3"
   }
 }
